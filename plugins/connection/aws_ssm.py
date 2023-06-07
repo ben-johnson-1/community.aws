@@ -276,6 +276,7 @@ import time
 try:
     import boto3
     from botocore.client import Config
+    from botocore.exceptions import ClientError
 except ImportError as e:
     pass
 
@@ -396,6 +397,7 @@ class Connection(ConnectionBase):
 
         region_name = self.get_option("region") or "us-east-1"
         profile_name = self.get_option("profile") or ""
+
         self._vvvv("_get_bucket_endpoint: S3 (global)")
         tmp_s3_client = self._get_boto_client(
             "s3",
@@ -426,14 +428,19 @@ class Connection(ConnectionBase):
         self._vvvv("INITIALIZE BOTO3 CLIENTS")
         profile_name = self.get_option("profile") or ""
         region_name = self.get_option("region")
+        account_id = self.get_option("owner-id")
+        execution_role = self.get_option("cross_account_execution_role")
+        cross_account_arn = f"arn:aws:iam::{account_id}:role/{execution_role}"
 
         # The SSM Boto client, currently used to initiate and manage the session
         # Note: does not handle the actual SSM session traffic
         self._vvvv("SETUP BOTO3 CLIENTS: SSM")
+
         ssm_client = self._get_boto_client(
             "ssm",
             region_name=region_name,
             profile_name=profile_name,
+            cross_account_arn=cross_account_arn
         )
         self._client = ssm_client
 
@@ -444,6 +451,7 @@ class Connection(ConnectionBase):
             region_name=s3_region_name,
             endpoint_url=s3_endpoint_url,
             profile_name=profile_name,
+            cross_account_arn=cross_account_arn
         )
 
         self._s3_client = s3_bucket_client
@@ -770,12 +778,32 @@ class Connection(ConnectionBase):
             params.update(extra_args)
         return client.generate_presigned_url(client_method, Params=params, ExpiresIn=3600, HttpMethod=http_method)
 
-    def _get_boto_client(self, service, region_name=None, profile_name=None, endpoint_url=None):
+    def _get_boto_client(self, service, region_name=None, profile_name=None, endpoint_url=None, cross_account_arn=None):
         """Gets a boto3 client based on the STS token"""
 
         aws_access_key_id = self.get_option("access_key_id")
         aws_secret_access_key = self.get_option("secret_access_key")
         aws_session_token = self.get_option("session_token")
+
+        if profile_name:
+            session_args["profile_name"] = profile_name
+        
+        if cross_account_arn:
+            sts = session.client("sts")
+            try:
+                self._vvvv(f"SSM Client: \nAssuming role from another account via STS {cross_account_arn}")
+                response = sts.assume_role(
+                    RoleArn=cross_account_arn,
+                    RoleSessionName="ansible-ssm-connection"
+                )
+
+                aws_access_key_id = response["Credentials"]['AccessKeyId']
+                aws_secret_access_key = response["Credentials"]['SecretAccessKey']
+                aws_session_token = response["Credentials"]['SessionToken']
+
+            except ClientError as e:
+                raise AnsibleConnectionFailure(f"Assume role failed: {self.instance_id}: Role: {cross_account_arn}")
+
 
         session_args = dict(
             aws_access_key_id=aws_access_key_id,
@@ -783,8 +811,7 @@ class Connection(ConnectionBase):
             aws_session_token=aws_session_token,
             region_name=region_name,
         )
-        if profile_name:
-            session_args["profile_name"] = profile_name
+        
         session = boto3.session.Session(**session_args)
 
         client = session.client(
